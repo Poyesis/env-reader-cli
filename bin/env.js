@@ -179,7 +179,7 @@ async function doCreate(cfg) {
   }
 }
 
-/** PUSH: PUT { env } to /env/push-cli/{secret} for each entry with secret */
+/** PUSH: POST { env } to /env/push-cli/{secret} for each entry with secret */
 async function doPush(cfg) {
   if (!cfg.envs?.length) {
     warn(
@@ -208,7 +208,7 @@ async function doPush(cfg) {
     info(`push: PUT ${url} (name="${name}")`);
 
     await fetchJson(url, {
-      method: "PUT",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ env: envText }),
     });
