@@ -2,17 +2,28 @@
 /**
  * Poyesis Env CLI
  *
+ * Schema (envs.json):
+ * {
+ *   "project": "archlist",
+ *   "envs": [
+ *     { "name": ".env", "secret": "..." },
+ *     { "name": ".env.local", "secret": "..." }
+ *   ]
+ * }
+ *
  * Commands:
- *   env create              - create secrets for entries with empty "secret" in envs.json (reads local files)
- *   env push              - push local file content for entries with a "secret"
- *   env pull                - pull envs for entries with a "secret" in envs.json and write local files
- *   env pull {secret}       - pull a single secret and write to .env (or --path), then upsert envs.json
+ *   env init <project>     - scan local env files, write envs.json with project & discovered envs (secrets empty for new ones)
+ *   env create             - scan, merge into envs.json, POST {project, name, env} for items missing "secret", save secrets
+ *   env push               - push local file content for entries with a "secret"
+ *   env pull               - pull envs for entries with a "secret" (reads envs.json) and write local files
+ *   env pull {secret}      - pull a single secret and write to .env (or --path), then upsert envs.json (overwrite if name exists)
  *
  * Examples:
+ *   npx env init archlist
  *   npx env create
  *   npx env push
  *   npx env pull
- *   npx env pull c6967... --path .production.env
+ *   npx env pull c6967... --path .env.production
  */
 
 const fs = require("fs");
@@ -21,10 +32,9 @@ const path = require("path");
 const { env: ENV } = process;
 
 const argv = parseArgs(process.argv.slice(2));
-const cmd = argv._[0];
-const maybeSecretArg = argv._[1]; // supports: env pull {secret}
+let cmd = argv._[0];
+const arg1 = argv._[1]; // used by: init <project>, pull {secret}
 
-// Config + defaults
 const CONFIG_PATH = path.resolve(argv.config || argv.c || "envs.json");
 const BASE_URL = (
   argv["base-url"] ||
@@ -45,52 +55,84 @@ main().catch((err) => {
 });
 
 async function main() {
-  if (!cmd || !["create", "push", "pull"].includes(cmd)) {
+  if (!cmd || !["init", "create", "push", "pull"].includes(cmd)) {
     printHelp();
     process.exit(cmd ? 2 : 0);
   }
 
-  // Special case: `env pull {secret}` (single pull + upsert envs.json)
-  if (
-    cmd === "pull" &&
-    typeof maybeSecretArg === "string" &&
-    maybeSecretArg.trim() !== ""
-  ) {
-    await doPullSingle(maybeSecretArg.trim(), SINGLE_PULL_PATH, MAP_NAME);
+  // `env pull {secret}` (single pull + upsert envs.json, overwriting if name exists)
+  if (cmd === "pull" && typeof arg1 === "string" && arg1.trim() !== "") {
+    const cfg = await safeLoadConfigObj(CONFIG_PATH);
+    await doPullSingle(cfg, arg1.trim(), SINGLE_PULL_PATH, MAP_NAME);
     return;
   }
 
-  // envs.json driven flows
-  const items = await loadConfig(CONFIG_PATH);
-  if (!Array.isArray(items)) {
-    throw new Error(
-      `Invalid ${CONFIG_PATH}: expected an array of { name, secret }`
-    );
+  // `env init <project>`: scan + write json with project and discovered envs (new ones have empty secret)
+  if (cmd === "init") {
+    const projectFromArg = (arg1 || "").trim();
+    if (!projectFromArg) {
+      logError("init: missing <project> name. Usage: npx env init <project>");
+      process.exit(2);
+    }
+    await doInit(projectFromArg);
+    return;
   }
 
+  // envs.json-driven flows
+  const cfg = await safeLoadConfigObj(CONFIG_PATH); // { project, envs: [] }
   switch (cmd) {
     case "create":
-      await doCreate(items);
+      await doCreate(cfg);
       break;
     case "push":
-      await doPush(items);
+      await doPush(cfg);
       break;
     case "pull":
-      await doPull(items);
+      await doPull(cfg);
       break;
   }
 }
 
-/** CREATE: For entries with empty secret, read local file, POST to create, store returned secret to envs.json */
-async function doCreate(items) {
-  let changed = false;
+/* -------------------- commands -------------------- */
 
-  for (const item of items) {
+/** INIT: scan local env files and write envs.json with project; new files get empty secret, existing secrets preserved */
+async function doInit(projectName) {
+  const existing = await safeLoadConfigObj(CONFIG_PATH);
+  const discovered = await scanEnvFiles(process.cwd());
+  // Merge into config (preserve existing secrets; add new with empty secret)
+  const merged = mergeEnvConfigObj(existing, discovered);
+  merged.project = projectName;
+  await saveConfigObj(CONFIG_PATH, merged);
+  info(
+    `init: wrote ${CONFIG_PATH} with project="${projectName}" and ${
+      merged.envs.length
+    } env entr${merged.envs.length === 1 ? "y" : "ies"}`
+  );
+}
+
+/** CREATE: scan -> merge -> POST {project, name, env} for items missing secret -> save secrets */
+async function doCreate(cfg) {
+  // 1) scan for .env files (so newly added files are included even if init wasn't run)
+  const discovered = await scanEnvFiles(process.cwd());
+
+  // 2) merge into config
+  const merged = mergeEnvConfigObj(cfg, discovered); // keeps existing secrets, adds new as empty
+  await saveConfigObj(CONFIG_PATH, merged);
+  info(
+    `create: wrote ${CONFIG_PATH} with project="${merged.project || ""}" and ${
+      merged.envs.length
+    } entr${merged.envs.length === 1 ? "y" : "ies"}`
+  );
+
+  // 3) create secrets for entries missing `secret`
+  if (!merged.project) {
+    warn(`create: no "project" in ${CONFIG_PATH}. Run: npx env init <project>`);
+  }
+
+  let changed = false;
+  for (const item of merged.envs) {
     const { name, secret } = item || {};
-    if (!name) {
-      warn(`create: skipping entry without "name"`);
-      continue;
-    }
+    if (!name) continue;
     if (secret && String(secret).trim() !== "") {
       info(`create: ${name} already has a secret, skipping`);
       continue;
@@ -98,27 +140,33 @@ async function doCreate(items) {
 
     const filePath = path.resolve(name);
     if (!fs.existsSync(filePath)) {
-      warn(`create: ${name} missing locally, skipping (no file to upload)`);
+      warn(`create: ${name} missing locally, skipping secret creation`);
       continue;
     }
 
     const envText = await fsp.readFile(filePath, "utf8");
     if (!envText.trim()) {
-      warn(`create: ${name} is empty, skipping`);
+      warn(`create: ${name} is empty, skipping secret creation`);
       continue;
     }
 
     const url = `${BASE_URL}${ensureLeadingSlash(CREATE_PATH)}`;
-    info(`create: POST ${url} (name="${name}")`);
+    info(
+      `create: POST ${url} (project="${merged.project || ""}", name="${name}")`
+    );
+
+    const payload = { name, env: envText };
+    if (merged.project) payload.project = merged.project;
 
     const res = await fetchJson(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, env: envText }),
+      body: JSON.stringify(payload),
     });
 
-    if (!res || !res.secret)
+    if (!res || !res.secret) {
       throw new Error(`API did not return a "secret" for ${name}`);
+    }
 
     item.secret = String(res.secret);
     info(`create: ${name} → secret saved`);
@@ -126,14 +174,21 @@ async function doCreate(items) {
   }
 
   if (changed) {
-    await saveConfig(CONFIG_PATH, items);
-    info(`create: updated ${CONFIG_PATH}`);
+    await saveConfigObj(CONFIG_PATH, merged);
+    info(`create: updated ${CONFIG_PATH} with new secrets`);
   }
 }
 
-/** PUSH: For entries with secret, read local file and PUT to push endpoint */
-async function doPush(items) {
-  for (const item of items) {
+/** PUSH: PUT { env } to /env/push-cli/{secret} for each entry with secret */
+async function doPush(cfg) {
+  if (!cfg.envs?.length) {
+    warn(
+      `push: no entries in ${CONFIG_PATH} (run "npx env init <project>" and/or "npx env create")`
+    );
+    return;
+  }
+
+  for (const item of cfg.envs) {
     const { name, secret } = item || {};
     if (!name || !secret) {
       warn(`push: skipping ${name || "(no name)"} (missing secret)`);
@@ -150,7 +205,6 @@ async function doPush(items) {
     const url = `${BASE_URL}${ensureLeadingSlash(
       PUSH_PATH.replace("{secret}", encodeURIComponent(secret))
     )}`;
-
     info(`push: PUT ${url} (name="${name}")`);
 
     await fetchJson(url, {
@@ -163,9 +217,15 @@ async function doPush(items) {
   }
 }
 
-/** PULL (multi): For entries with secret, GET remote and write/overwrite local file */
-async function doPull(items) {
-  for (const item of items) {
+/** PULL (multi): GET -> write files for entries with secret */
+async function doPull(cfg) {
+  if (!cfg.envs?.length) {
+    warn(
+      `pull: no entries in ${CONFIG_PATH} (run "npx env init <project>" and "npx env create")`
+    );
+    return;
+  }
+  for (const item of cfg.envs) {
     const { name, secret } = item || {};
     if (!name || !secret) {
       warn(`pull: skipping ${name || "(no name)"} (missing secret)`);
@@ -175,14 +235,14 @@ async function doPull(items) {
   }
 }
 
-/** PULL (single): env pull {secret} -> write to specified path (default: .env) and upsert envs.json */
-async function doPullSingle(secret, filePath, mapName) {
+/** PULL (single): env pull {secret} -> write to --path (default .env) + upsert mapping into envs.json (overwrite if name exists) */
+async function doPullSingle(cfg, secret, filePath, mapName) {
   info(`pull: single secret → writing to ${filePath}`);
   await pullToFile(secret, filePath);
 
-  // Upsert envs.json with { name, secret }
-  const name = mapName || filePath; // default mapping name = output file path
-  await upsertConfigEntry(CONFIG_PATH, name, secret);
+  const name = mapName || filePath;
+  const merged = upsertEnvMapping(cfg, name, secret); // overwrites existing secret for that name
+  await saveConfigObj(CONFIG_PATH, merged);
   info(`pull: updated ${CONFIG_PATH} with { name: "${name}" }`);
 }
 
@@ -207,38 +267,112 @@ async function pullToFile(secret, filePath) {
   info(`pull: wrote ${abs} (${envText.length} bytes)`);
 }
 
-/* -------------------- config helpers -------------------- */
+/* -------------------- config + scanning -------------------- */
 
-async function loadConfig(p) {
-  if (!fs.existsSync(p)) {
-    throw new Error(
-      `Config file not found: ${p}\nCreate one like: [{"name":".env","secret":""},{"name":".production.env","secret":""}]`
-    );
-  }
-  const raw = await fsp.readFile(p, "utf8");
+function emptyConfig() {
+  return { project: "", envs: [] };
+}
+
+async function safeLoadConfigObj(p) {
   try {
-    return JSON.parse(raw);
+    if (!fs.existsSync(p)) return emptyConfig();
+    const raw = await fsp.readFile(p, "utf8");
+    const parsed = JSON.parse(raw);
+    const envs = Array.isArray(parsed?.envs)
+      ? parsed.envs
+          .map((x) => ({ name: x?.name, secret: x?.secret || "" }))
+          .filter((x) => !!x.name)
+      : [];
+    const project = typeof parsed?.project === "string" ? parsed.project : "";
+    return { project, envs };
   } catch {
-    throw new Error(`Invalid JSON in ${p}`);
+    return emptyConfig();
   }
 }
 
-async function saveConfig(p, obj) {
-  const text = JSON.stringify(obj, null, 2) + "\n";
+async function saveConfigObj(p, obj) {
+  const clean = {
+    project: obj.project || "",
+    envs: (obj.envs || []).map((x) => ({
+      name: x.name,
+      secret: x.secret || "",
+    })),
+  };
+  const text = JSON.stringify(clean, null, 2) + "\n";
   await fsp.writeFile(p, text, "utf8");
 }
 
-async function upsertConfigEntry(configPath, name, secret) {
-  let items = [];
-  try {
-    items = await loadConfig(configPath);
-  } catch {
-    items = [];
+function upsertEnvMapping(cfg, name, secret) {
+  const out = {
+    project: cfg.project || "",
+    envs: Array.isArray(cfg.envs) ? [...cfg.envs] : [],
+  };
+  const idx = out.envs.findIndex((e) => e?.name === name);
+  if (idx >= 0) out.envs[idx].secret = secret; // overwrite if exists
+  else out.envs.push({ name, secret });
+  out.envs.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+function mergeEnvConfigObj(cfg, discoveredPaths) {
+  const out = {
+    project: cfg.project || "",
+    envs: Array.isArray(cfg.envs) ? [...cfg.envs] : [],
+  };
+  const byName = new Map(out.envs.map((e) => [e.name, e]));
+  for (const p of discoveredPaths) {
+    if (!byName.has(p)) byName.set(p, { name: p, secret: "" }); // new -> empty secret
   }
-  const idx = items.findIndex((x) => x && x.name === name);
-  if (idx >= 0) items[idx].secret = secret;
-  else items.push({ name, secret });
-  await saveConfig(configPath, items);
+  out.envs = Array.from(byName.values()).sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+  return out;
+}
+
+const DEFAULT_IGNORES = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  ".turbo",
+  "coverage",
+  "out",
+  ".vercel",
+  ".cache",
+]);
+
+function looksLikeEnvFile(basename) {
+  return (
+    /^\.env(\..+)?$/i.test(basename) || // .env, .env.local, .env.prod
+    /^\..+\.env$/i.test(basename) // .production.env, .staging.env
+  );
+}
+
+async function scanEnvFiles(rootDir) {
+  const results = new Set();
+  await walk(rootDir, results);
+  return Array.from(results).sort();
+}
+
+async function walk(dir, results) {
+  const entries = await fsp.readdir(dir, { withFileTypes: true });
+  for (const ent of entries) {
+    const name = ent.name;
+    const full = path.join(dir, name);
+
+    if (ent.isDirectory()) {
+      if (DEFAULT_IGNORES.has(name)) continue;
+      if (name.startsWith(".") && name !== ".") continue;
+      await walk(full, results);
+    } else if (ent.isFile()) {
+      const base = path.basename(full);
+      if (looksLikeEnvFile(base)) {
+        const rel = path.relative(process.cwd(), full) || base;
+        results.add(rel);
+      }
+    }
+  }
 }
 
 /* -------------------- misc utils -------------------- */
@@ -248,7 +382,7 @@ function ensureLeadingSlash(s) {
 }
 
 async function fetchJson(url, init) {
-  // Node 18+ has global fetch; if you target older Node, add node-fetch
+  // Node 18+ has global fetch
   const res = await fetch(url, init);
   if (!res.ok) {
     const body = await safeText(res);
@@ -307,18 +441,32 @@ function printHelp() {
   console.log(`
 Poyesis Env CLI
 Usage:
-  npx env <command>
+  npx env <command> [options]
 
 Commands:
-  create                    Create secrets for entries with empty "secret" (reads envs.json)
+  init <project>            Scan local .env files and create/update envs.json with project & discovered envs (secrets empty for new ones)
+  create                    Scan repo for .env files, merge into envs.json, then create secrets for entries missing "secret"
   push                      Push local file content to API for entries with "secret"
   pull                      Pull envs for entries with "secret" (reads envs.json)
-  pull {secret}             Pull a single secret and write to .env (or --path), then upsert envs.json
+  pull {secret}             Pull a single secret and write to .env (or --path), then upsert envs.json (overwrite if name exists)
+
+Options:
+  -c, --config <path>       Path to envs.json (default: ./envs.json)
+  -u, --base-url <url>      API base URL (default: $POYESIS_ENV_BASE_URL or https://api.poyesis.fr)
+      --read-path <tpl>     Read endpoint template (default: /env/read-cli/{secret})
+      --create-path <path>  Create endpoint path (default: /env/create-cli) [POST {project?, name, env}]
+      --push-path <tpl>     Push endpoint template (default: /env/push-cli/{secret}) [PUT {env}]
+  -p, --path <file>         File to write for 'pull {secret}' (default: .env)
+      --name <name>         Mapping name stored in envs.json for 'pull {secret}' (default: --path)
 
 envs.json example:
-[
-  { "name": ".env", "secret": "" },
-  { "name": ".production.env", "secret": "" }
-]
+{
+  "project": "archlist",
+  "envs": [
+    { "name": ".env", "secret": "" },
+    { "name": ".env.local", "secret": "" },
+    { "name": ".env.production", "secret": "" }
+  ]
+}
 `);
 }
