@@ -12,11 +12,22 @@
  * }
  *
  * Commands:
- *   env init <project>     - scan local env files, write envs.json with project & discovered envs (secrets empty for new ones)
+ *   env init <project>     - fetch remote env list, create local .env files (optional overwrite), fill/merge envs.json
  *   env create             - scan, merge into envs.json, POST {project, name, env} for items missing "secret", save secrets
  *   env push               - push local file content for entries with a "secret"
  *   env pull               - pull envs for entries with a "secret" (reads envs.json) and write local files
  *   env pull {secret}      - pull a single secret and write to .env (or --path), then upsert envs.json (overwrite if name exists)
+ *
+ * Flags (selected):
+ *   -c, --config <path>    path to envs.json (default: ./envs.json)
+ *   -u, --base-url <url>   API base URL (default: $POYESIS_ENV_BASE_URL or https://api.poyesis.fr)
+ *       --list-path <tpl>  list endpoint template (default: /env/list-cli/{project})
+ *       --read-path <tpl>  read endpoint template (default: /env/read-cli/{secret})
+ *       --create-path <p>  create endpoint path (default: /env/create-cli)
+ *       --push-path <tpl>  push endpoint template (default: /env/push-cli/{secret})
+ *       --overwrite        for init: overwrite local files if they already exist (default: false)
+ *   -p, --path <file>      for 'pull {secret}': output file (default: .env)
+ *       --name <name>      mapping name stored in envs.json for 'pull {secret}' (default: --path)
  *
  * Examples:
  *   npx env init archlist
@@ -42,11 +53,13 @@ const BASE_URL = (
   ENV.POYESIS_ENV_BASE_URL ||
   "https://api.poyesis.fr"
 ).replace(/\/+$/, "");
+const LIST_PATH = argv["list-path"] || "/env/list-cli/{project}";
 const READ_PATH = argv["read-path"] || "/env/read-cli/{secret}";
 const CREATE_PATH = argv["create-path"] || "/env/create-cli";
 const PUSH_PATH = argv["push-path"] || "/env/push-cli/{secret}";
 const SINGLE_PULL_PATH = argv.path || argv.p || ".env";
 const MAP_NAME = argv.name || null;
+const OVERWRITE = !!argv.overwrite; // affects init only
 const QUIET = !!(argv.quiet || argv.q);
 
 main().catch((err) => {
@@ -60,14 +73,14 @@ async function main() {
     process.exit(cmd ? 2 : 0);
   }
 
-  // `env pull {secret}` (single pull + upsert envs.json, overwriting if name exists)
+  // `env pull {secret}` (single pull + upsert envs.json)
   if (cmd === "pull" && typeof arg1 === "string" && arg1.trim() !== "") {
     const cfg = await safeLoadConfigObj(CONFIG_PATH);
     await doPullSingle(cfg, arg1.trim(), SINGLE_PULL_PATH, MAP_NAME);
     return;
   }
 
-  // `env init <project>`: scan + write json with project and discovered envs (new ones have empty secret)
+  // `env init <project>`: fetch list, write local files, fill/merge envs.json
   if (cmd === "init") {
     const projectFromArg = (arg1 || "").trim();
     if (!projectFromArg) {
@@ -95,16 +108,67 @@ async function main() {
 
 /* -------------------- commands -------------------- */
 
-/** INIT: scan local env files and write envs.json with project; new files get empty secret, existing secrets preserved */
+/** INIT:
+ *  - fetch remote list for project
+ *  - write local files (env text), if --overwrite or file not exists
+ *  - upsert envs.json with { project, envs: [{ name, secret }] } (overwrite secret if name exists)
+ */
 async function doInit(projectName) {
+  // Fetch remote list
+  const listUrl = `${BASE_URL}${ensureLeadingSlash(
+    LIST_PATH.replace("{project}", encodeURIComponent(projectName))
+  )}`;
+  info(`init: GET ${listUrl}`);
+  const listResp = await fetchJson(listUrl, { method: "GET" });
+
+  // Normalize response to array of { name, secret, env? }
+  const remoteItemsRaw = Array.isArray(listResp)
+    ? listResp
+    : Array.isArray(listResp?.envs)
+    ? listResp.envs
+    : [];
+  const remoteItems = remoteItemsRaw
+    .map((x) => ({
+      name: x?.name,
+      secret: x?.secret || "",
+      env: typeof x?.env === "string" ? x.env : null,
+    }))
+    .filter((x) => !!x.name);
+
+  // Ensure we have env text for each; if not in the list payload, fetch via read
+  for (const item of remoteItems) {
+    if (item.env == null && item.secret) {
+      item.env = await pullToString(item.secret);
+    }
+  }
+
+  // Write local files
+  for (const { name, env } of remoteItems) {
+    if (typeof env !== "string") continue;
+    const abs = path.resolve(name);
+    const exists = fs.existsSync(abs);
+    if (exists && !OVERWRITE) {
+      info(`init: ${name} exists (skipped). Use --overwrite to replace.`);
+      continue;
+    }
+    await fsp.mkdir(path.dirname(abs), { recursive: true });
+    await fsp.writeFile(abs, env, "utf8");
+    await fsp.chmod(abs, 0o600);
+    info(`init: wrote ${abs} (${env.length} bytes)`);
+  }
+
+  // Merge into envs.json (set project; upsert secrets for names)
   const existing = await safeLoadConfigObj(CONFIG_PATH);
-  const discovered = await scanEnvFiles(process.cwd());
-  // Merge into config (preserve existing secrets; add new with empty secret)
-  const merged = mergeEnvConfigObj(existing, discovered);
-  merged.project = projectName;
+  let merged = {
+    project: projectName,
+    envs: Array.isArray(existing.envs) ? [...existing.envs] : [],
+  };
+  for (const { name, secret } of remoteItems) {
+    merged = upsertEnvMapping(merged, name, secret); // overwrite if name exists
+  }
   await saveConfigObj(CONFIG_PATH, merged);
   info(
-    `init: wrote ${CONFIG_PATH} with project="${projectName}" and ${
+    `init: updated ${CONFIG_PATH} with project="${projectName}" and ${
       merged.envs.length
     } env entr${merged.envs.length === 1 ? "y" : "ies"}`
   );
@@ -112,11 +176,11 @@ async function doInit(projectName) {
 
 /** CREATE: scan -> merge -> POST {project, name, env} for items missing secret -> save secrets */
 async function doCreate(cfg) {
-  // 1) scan for .env files (so newly added files are included even if init wasn't run)
+  // 1) scan for .env files (include newly added)
   const discovered = await scanEnvFiles(process.cwd());
 
-  // 2) merge into config
-  const merged = mergeEnvConfigObj(cfg, discovered); // keeps existing secrets, adds new as empty
+  // 2) merge into config (preserve existing secrets; add new names with empty secret)
+  const merged = mergeEnvConfigObj(cfg, discovered);
   await saveConfigObj(CONFIG_PATH, merged);
   info(
     `create: wrote ${CONFIG_PATH} with project="${merged.project || ""}" and ${
@@ -125,9 +189,8 @@ async function doCreate(cfg) {
   );
 
   // 3) create secrets for entries missing `secret`
-  if (!merged.project) {
+  if (!merged.project)
     warn(`create: no "project" in ${CONFIG_PATH}. Run: npx env init <project>`);
-  }
 
   let changed = false;
   for (const item of merged.envs) {
@@ -164,9 +227,8 @@ async function doCreate(cfg) {
       body: JSON.stringify(payload),
     });
 
-    if (!res || !res.secret) {
+    if (!res || !res.secret)
       throw new Error(`API did not return a "secret" for ${name}`);
-    }
 
     item.secret = String(res.secret);
     info(`create: ${name} → secret saved`);
@@ -179,7 +241,7 @@ async function doCreate(cfg) {
   }
 }
 
-/** PUSH: POST { env } to /env/push-cli/{secret} for each entry with secret */
+/** PUSH: PUT { env } to /env/push-cli/{secret} for each entry with secret */
 async function doPush(cfg) {
   if (!cfg.envs?.length) {
     warn(
@@ -208,7 +270,7 @@ async function doPush(cfg) {
     info(`push: PUT ${url} (name="${name}")`);
 
     await fetchJson(url, {
-      method: "POST",
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ env: envText }),
     });
@@ -241,25 +303,27 @@ async function doPullSingle(cfg, secret, filePath, mapName) {
   await pullToFile(secret, filePath);
 
   const name = mapName || filePath;
-  const merged = upsertEnvMapping(cfg, name, secret); // overwrites existing secret for that name
+  const merged = upsertEnvMapping(cfg, name, secret); // overwrite if exists
   await saveConfigObj(CONFIG_PATH, merged);
   info(`pull: updated ${CONFIG_PATH} with { name: "${name}" }`);
 }
 
-/** Core pull helper */
-async function pullToFile(secret, filePath) {
+/* -------------------- helpers -------------------- */
+
+async function pullToString(secret) {
   const url = `${BASE_URL}${ensureLeadingSlash(
     READ_PATH.replace("{secret}", encodeURIComponent(secret))
   )}`;
-  info(`pull: GET ${url}`);
-
   const res = await fetchJson(url, { method: "GET" });
-  const envText = res && typeof res.env === "string" ? res.env : "";
+  return res && typeof res.env === "string" ? res.env : "";
+}
+
+async function pullToFile(secret, filePath) {
+  const envText = await pullToString(secret);
   if (!envText) {
     warn(`pull: secret returned empty env`);
     return;
   }
-
   const abs = path.resolve(filePath);
   await fsp.mkdir(path.dirname(abs), { recursive: true });
   await fsp.writeFile(abs, envText, "utf8");
@@ -267,7 +331,7 @@ async function pullToFile(secret, filePath) {
   info(`pull: wrote ${abs} (${envText.length} bytes)`);
 }
 
-/* -------------------- config + scanning -------------------- */
+/* ---------- config + scanning (unchanged from prior) ---------- */
 
 function emptyConfig() {
   return { project: "", envs: [] };
@@ -308,7 +372,7 @@ function upsertEnvMapping(cfg, name, secret) {
     envs: Array.isArray(cfg.envs) ? [...cfg.envs] : [],
   };
   const idx = out.envs.findIndex((e) => e?.name === name);
-  if (idx >= 0) out.envs[idx].secret = secret; // overwrite if exists
+  if (idx >= 0) out.envs[idx].secret = secret;
   else out.envs.push({ name, secret });
   out.envs.sort((a, b) => a.name.localeCompare(b.name));
   return out;
@@ -444,7 +508,7 @@ Usage:
   npx env <command> [options]
 
 Commands:
-  init <project>            Scan local .env files and create/update envs.json with project & discovered envs (secrets empty for new ones)
+  init <project>            Fetch remote env list, create local .env files (use --overwrite to replace), and fill envs.json
   create                    Scan repo for .env files, merge into envs.json, then create secrets for entries missing "secret"
   push                      Push local file content to API for entries with "secret"
   pull                      Pull envs for entries with "secret" (reads envs.json)
@@ -453,9 +517,11 @@ Commands:
 Options:
   -c, --config <path>       Path to envs.json (default: ./envs.json)
   -u, --base-url <url>      API base URL (default: $POYESIS_ENV_BASE_URL or https://api.poyesis.fr)
+      --list-path <tpl>     List endpoint template (default: /env/list-cli/{project})
       --read-path <tpl>     Read endpoint template (default: /env/read-cli/{secret})
       --create-path <path>  Create endpoint path (default: /env/create-cli) [POST {project?, name, env}]
       --push-path <tpl>     Push endpoint template (default: /env/push-cli/{secret}) [PUT {env}]
+      --overwrite           For init: overwrite local files if they already exist (default: false)
   -p, --path <file>         File to write for 'pull {secret}' (default: .env)
       --name <name>         Mapping name stored in envs.json for 'pull {secret}' (default: --path)
 
