@@ -12,11 +12,11 @@
  * }
  *
  * Commands:
- *   env init <project>     - fetch remote env list, create local .env files (optional overwrite), fill/merge envs.json
- *   env create             - scan, merge into envs.json, POST {project, name, env} for items missing "secret", save secrets
- *   env push               - push local file content for entries with a "secret"
- *   env pull               - pull envs for entries with a "secret" (reads envs.json) and write local files
- *   env pull {secret}      - pull a single secret and write to .env (or --path), then upsert envs.json (overwrite if name exists)
+ *   env init <project> <category> - fetch remote env list, create local .env files (optional overwrite), fill/merge envs.json
+ *   env create                    - scan, merge into envs.json, POST {project, name, env} for items missing "secret", save secrets
+ *   env push                      - push local file content for entries with a "secret"
+ *   env pull                      - pull envs for entries with a "secret" (reads envs.json) and write local files
+ *   env pull {secret}             - pull a single secret and write to .env (or --path), then upsert envs.json (overwrite if name exists)
  *
  * Flags (selected):
  *   -c, --config <path>    path to envs.json (default: ./envs.json)
@@ -44,7 +44,7 @@ const { env: ENV } = process;
 
 const argv = parseArgs(process.argv.slice(2));
 let cmd = argv._[0];
-const arg1 = argv._[1]; // used by: init <project>, pull {secret}
+const arg1 = argv._[2]; // used by: init <project> <category>, pull {secret}
 
 const CONFIG_PATH = path.resolve(argv.config || argv.c || "envs.json");
 const BASE_URL = (
@@ -53,7 +53,7 @@ const BASE_URL = (
   ENV.POYESIS_ENV_BASE_URL ||
   "https://api.poyesis.fr"
 ).replace(/\/+$/, "");
-const LIST_PATH = argv["list-path"] || "/env/list-cli/{project}";
+const LIST_PATH = argv["list-path"] || "/env/list-cli/{project}/{category}";
 const READ_PATH = argv["read-path"] || "/env/read-cli/{secret}";
 const CREATE_PATH = argv["create-path"] || "/env/create-cli";
 const PUSH_PATH = argv["push-path"] || "/env/push-cli/{secret}";
@@ -80,14 +80,25 @@ async function main() {
     return;
   }
 
-  // `env init <project>`: fetch list, write local files, fill/merge envs.json
+  // `env init <project> <category>`: fetch list, write local files, fill/merge envs.json
   if (cmd === "init") {
     const projectFromArg = (arg1 || "").trim();
+    const categoryFromArg = (arg2 || "").trim();
     if (!projectFromArg) {
-      logError("init: missing <project> name. Usage: npx env init <project>");
+      logError(
+        "init: missing <project> name. Usage: npx env init <project> <category>"
+      );
       process.exit(2);
     }
-    await doInit(projectFromArg);
+
+    if (!categoryFromArg) {
+      logError(
+        "init: missing <category> name. Usage: npx env init <project> <category>"
+      );
+      process.exit(2);
+    }
+
+    await doInit(projectFromArg, categoryFromArg);
     return;
   }
 
@@ -113,10 +124,13 @@ async function main() {
  *  - write local files (env text), if --overwrite or file not exists
  *  - upsert envs.json with { project, envs: [{ name, secret }] } (overwrite secret if name exists)
  */
-async function doInit(projectName) {
+async function doInit(projectName, category) {
   // Fetch remote list
   const listUrl = `${BASE_URL}${ensureLeadingSlash(
-    LIST_PATH.replace("{project}", encodeURIComponent(projectName))
+    LIST_PATH.replace("{project}", encodeURIComponent(projectName)).replace(
+      "{category}",
+      encodeURIComponent(category)
+    )
   )}`;
   info(`init: GET ${listUrl}`);
   const listResp = await fetchJson(listUrl, { method: "GET" });
@@ -245,7 +259,7 @@ async function doCreate(cfg) {
 async function doPush(cfg) {
   if (!cfg.envs?.length) {
     warn(
-      `push: no entries in ${CONFIG_PATH} (run "npx env init <project>" and/or "npx env create")`
+      `push: no entries in ${CONFIG_PATH} (run "npx env init <project> <category>" and/or "npx env create")`
     );
     return;
   }
@@ -283,7 +297,7 @@ async function doPush(cfg) {
 async function doPull(cfg) {
   if (!cfg.envs?.length) {
     warn(
-      `pull: no entries in ${CONFIG_PATH} (run "npx env init <project>" and "npx env create")`
+      `pull: no entries in ${CONFIG_PATH} (run "npx env init <project> <category>" and "npx env create")`
     );
     return;
   }
@@ -508,7 +522,7 @@ Usage:
   npx env <command> [options]
 
 Commands:
-  init <project>            Fetch remote env list, create local .env files (use --overwrite to replace), and fill envs.json
+  init <project> <category> Fetch remote env list, create local .env files (use --overwrite to replace), and fill envs.json
   create                    Scan repo for .env files, merge into envs.json, then create secrets for entries missing "secret"
   push                      Push local file content to API for entries with "secret"
   pull                      Pull envs for entries with "secret" (reads envs.json)

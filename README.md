@@ -9,3 +9,4 @@ npx env push
 npx env pull
 npx env pull <secret> --path .production.env
 ```
+w
