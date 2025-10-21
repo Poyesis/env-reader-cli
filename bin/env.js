@@ -44,7 +44,8 @@ const { env: ENV } = process;
 
 const argv = parseArgs(process.argv.slice(2));
 let cmd = argv._[0];
-const arg1 = argv._[2]; // used by: init <project> <category>, pull {secret}
+const arg1 = argv._[1]; // used by: init <project> <category>, pull {secret}
+const arg2 = argv._[2]; // used by: init <project> <category>, pull {secret}
 
 const CONFIG_PATH = path.resolve(argv.config || argv.c || "envs.json");
 const BASE_URL = (
