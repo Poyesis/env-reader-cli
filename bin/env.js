@@ -176,6 +176,7 @@ async function doInit(projectName, category) {
   const existing = await safeLoadConfigObj(CONFIG_PATH);
   let merged = {
     project: projectName,
+    category: category,
     envs: Array.isArray(existing.envs) ? [...existing.envs] : [],
   };
   for (const { name, secret } of remoteItems) {
@@ -235,6 +236,7 @@ async function doCreate(cfg) {
 
     const payload = { name, env: envText };
     if (merged.project) payload.project = merged.project;
+    if (merged.category) payload.category = merged.category;
 
     const res = await fetchJson(url, {
       method: "POST",
@@ -349,7 +351,7 @@ async function pullToFile(secret, filePath) {
 /* ---------- config + scanning (unchanged from prior) ---------- */
 
 function emptyConfig() {
-  return { project: "", envs: [] };
+  return { project: "", category: "", envs: [] };
 }
 
 async function safeLoadConfigObj(p) {
@@ -363,7 +365,9 @@ async function safeLoadConfigObj(p) {
           .filter((x) => !!x.name)
       : [];
     const project = typeof parsed?.project === "string" ? parsed.project : "";
-    return { project, envs };
+    const category =
+      typeof parsed?.category === "string" ? parsed.category : "";
+    return { project, category, envs };
   } catch {
     return emptyConfig();
   }
@@ -372,6 +376,7 @@ async function safeLoadConfigObj(p) {
 async function saveConfigObj(p, obj) {
   const clean = {
     project: obj.project || "",
+    category: obj.category || "",
     envs: (obj.envs || []).map((x) => ({
       name: x.name,
       secret: x.secret || "",
@@ -384,6 +389,7 @@ async function saveConfigObj(p, obj) {
 function upsertEnvMapping(cfg, name, secret) {
   const out = {
     project: cfg.project || "",
+    category: cfg.category || "",
     envs: Array.isArray(cfg.envs) ? [...cfg.envs] : [],
   };
   const idx = out.envs.findIndex((e) => e?.name === name);
@@ -396,6 +402,7 @@ function upsertEnvMapping(cfg, name, secret) {
 function mergeEnvConfigObj(cfg, discoveredPaths) {
   const out = {
     project: cfg.project || "",
+    category: cfg.category || "",
     envs: Array.isArray(cfg.envs) ? [...cfg.envs] : [],
   };
   const byName = new Map(out.envs.map((e) => [e.name, e]));
